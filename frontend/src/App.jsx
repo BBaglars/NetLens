@@ -37,21 +37,55 @@ function extractDestinationHost(destination) {
   return s
 }
 
-function rowClassForPort(port) {
-  if (port === 443) return 'netlens-row--https'
+/**
+ * Row highlight from application-layer DPI (fallback to well-known ports).
+ */
+function rowClassForPacket(p) {
+  const app = String(p.applicationLayer || '').toUpperCase()
+  if (app === 'TLS') return 'netlens-row--tls'
+  if (app === 'HTTP') return 'netlens-row--http'
+  if (app === 'DNS' || String(p.protocol || '').toUpperCase() === 'DNS') {
+    return 'netlens-row--dns'
+  }
+  const port = getDestinationPort(String(p.destination))
+  if (port === 443) return 'netlens-row--tls'
   if (port === 80) return 'netlens-row--http'
   return ''
 }
 
 /**
- * Live filter: substring match on source/destination; numeric query matches ports.
+ * Build a plain object for the details panel / JSON export (no internal id).
+ */
+function packetToDetailObject(p) {
+  return {
+    source: p.source,
+    destination: p.destination,
+    protocol: p.protocol,
+    length: p.length,
+    timestamp: p.timestamp,
+    applicationLayer: p.applicationLayer || '',
+    payloadInfo: p.payloadInfo || '',
+  }
+}
+
+/**
+ * Live filter: substring match on endpoints, payload info, app layer; numeric query matches ports.
  */
 function rowMatchesSearch(p, rawQuery) {
   const q = rawQuery.trim().toLowerCase()
   if (!q) return true
   const src = String(p.source).toLowerCase()
   const dst = String(p.destination).toLowerCase()
-  if (src.includes(q) || dst.includes(q)) return true
+  const info = String(p.payloadInfo || '').toLowerCase()
+  const app = String(p.applicationLayer || '').toLowerCase()
+  if (
+    src.includes(q) ||
+    dst.includes(q) ||
+    info.includes(q) ||
+    app.includes(q)
+  ) {
+    return true
+  }
   if (/^\d+$/.test(q)) {
     const port = parseInt(q, 10)
     const ps = getDestinationPort(String(p.source))
@@ -68,6 +102,7 @@ function App() {
   const [totalPackets, setTotalPackets] = useState(0)
   const [pps, setPps] = useState(0)
   const [topDestination, setTopDestination] = useState('—')
+  const [selectedId, setSelectedId] = useState(null)
 
   const packetIdRef = useRef(0)
   const frozenRef = useRef(false)
@@ -105,6 +140,8 @@ function App() {
           protocol: data.protocol ?? '—',
           length: data.length ?? '—',
           timestamp: data.timestamp ?? '—',
+          payloadInfo: data.payloadInfo ?? '',
+          applicationLayer: data.applicationLayer ?? '',
         }
 
         setTotalPackets((n) => n + 1)
@@ -145,7 +182,29 @@ function App() {
     [packets, searchQuery],
   )
 
+  const selectedPacket = useMemo(
+    () => packets.find((p) => p.id === selectedId) ?? null,
+    [packets, selectedId],
+  )
+
   const toggleFreeze = () => setFrozen((f) => !f)
+
+  const handleRowActivate = (p) => {
+    setSelectedId((id) => (id === p.id ? null : p.id))
+  }
+
+  const handleRowKeyDown = (e, p) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      handleRowActivate(p)
+    }
+  }
+
+  const detailJson = selectedPacket
+    ? JSON.stringify(packetToDetailObject(selectedPacket), null, 2)
+    : ''
+
+  const colCount = 6
 
   return (
     <div className="netlens">
@@ -161,7 +220,7 @@ function App() {
             onClick={toggleFreeze}
             aria-pressed={frozen}
           >
-            {frozen ? 'Devam' : 'Dondur'}
+            {frozen ? 'Resume' : 'Freeze'}
           </button>
           <div className="netlens-status">
             <span
@@ -169,108 +228,191 @@ function App() {
               aria-hidden="true"
               title={frozen ? 'Paused' : 'Live capture'}
             />
-            <span className="netlens-live-label">Canlı Dinleniyor...</span>
+            <span className="netlens-live-label">Listening live…</span>
           </div>
         </div>
       </header>
 
       <main className="netlens-main">
-        <div className="netlens-panel">
-          <div className="netlens-panel-head">
-            <span className="netlens-panel-title">Paket akışı</span>
-            <span className="netlens-panel-meta">
-              Son {MAX_PACKETS} paket
-            </span>
-          </div>
-
-          <div className="netlens-stats">
-            <div className="netlens-stat-card">
-              <span className="netlens-stat-label">Total Packets</span>
-              <span className="netlens-stat-value netlens-stat-value--mono">
-                {totalPackets.toLocaleString()}
+        <div
+          className={`netlens-workspace${selectedPacket ? ' netlens-workspace--split' : ''}`}
+        >
+          <div className="netlens-panel netlens-panel--feed">
+            <div className="netlens-panel-head">
+              <span className="netlens-panel-title">Packet stream</span>
+              <span className="netlens-panel-meta">
+                Last {MAX_PACKETS} packets
               </span>
             </div>
-            <div className="netlens-stat-card">
-              <span className="netlens-stat-label">Current PPS</span>
-              <span className="netlens-stat-value netlens-stat-value--mono">
-                {pps.toLocaleString()}
-              </span>
-            </div>
-            <div className="netlens-stat-card">
-              <span className="netlens-stat-label">Top Destination</span>
-              <span
-                className="netlens-stat-value netlens-stat-value--mono netlens-stat-value--truncate"
-                title={topDestination}
-              >
-                {topDestination}
-              </span>
-            </div>
-          </div>
 
-          <div className="netlens-toolbar">
-            <label className="netlens-search-label" htmlFor="netlens-filter">
-              Filtre
-            </label>
-            <input
-              id="netlens-filter"
-              type="search"
-              className="netlens-search"
-              placeholder="IP veya port (örn. 192.168 veya 443)…"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </div>
+            <div className="netlens-stats">
+              <div className="netlens-stat-card">
+                <span className="netlens-stat-label">Total Packets</span>
+                <span className="netlens-stat-value netlens-stat-value--mono">
+                  {totalPackets.toLocaleString()}
+                </span>
+              </div>
+              <div className="netlens-stat-card">
+                <span className="netlens-stat-label">Current PPS</span>
+                <span className="netlens-stat-value netlens-stat-value--mono">
+                  {pps.toLocaleString()}
+                </span>
+              </div>
+              <div className="netlens-stat-card">
+                <span className="netlens-stat-label">Top Destination</span>
+                <span
+                  className="netlens-stat-value netlens-stat-value--mono netlens-stat-value--truncate"
+                  title={topDestination}
+                >
+                  {topDestination}
+                </span>
+              </div>
+            </div>
 
-          <div className="netlens-table-wrap">
-            <table className="netlens-table">
-              <thead>
-                <tr>
-                  <th>Kaynak</th>
-                  <th>Hedef</th>
-                  <th>Protokol</th>
-                  <th>Uzunluk</th>
-                  <th>Zaman</th>
-                </tr>
-              </thead>
-              <tbody>
-                {packets.length === 0 ? (
+            <div className="netlens-toolbar">
+              <label className="netlens-search-label" htmlFor="netlens-filter">
+                Filter
+              </label>
+              <input
+                id="netlens-filter"
+                type="search"
+                className="netlens-search"
+                placeholder="IP, port, protocol, or payload text…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+
+            <div className="netlens-table-wrap">
+              <table className="netlens-table">
+                <thead>
                   <tr>
-                    <td colSpan={5} className="netlens-empty">
-                      Bağlantı bekleniyor veya henüz paket yok…
-                    </td>
+                    <th>Source</th>
+                    <th>Destination</th>
+                    <th>Protocol</th>
+                    <th>Length</th>
+                    <th>Time</th>
+                    <th>Info</th>
                   </tr>
-                ) : filteredPackets.length === 0 ? (
-                  <tr>
-                    <td colSpan={5} className="netlens-empty">
-                      Filtreyle eşleşen paket yok.
-                    </td>
-                  </tr>
-                ) : (
-                  filteredPackets.map((p) => {
-                    const port = getDestinationPort(p.destination)
-                    return (
-                      <tr
-                        key={p.id}
-                        className={rowClassForPort(port)}
-                      >
-                        <td className="netlens-mono">{String(p.source)}</td>
-                        <td className="netlens-mono">
-                          {String(p.destination)}
-                        </td>
-                        <td>{String(p.protocol)}</td>
-                        <td className="netlens-num">{String(p.length)}</td>
-                        <td className="netlens-mono netlens-ts">
-                          {String(p.timestamp)}
-                        </td>
-                      </tr>
-                    )
-                  })
-                )}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {packets.length === 0 ? (
+                    <tr>
+                      <td colSpan={colCount} className="netlens-empty">
+                        Waiting for connection or no packets yet…
+                      </td>
+                    </tr>
+                  ) : filteredPackets.length === 0 ? (
+                    <tr>
+                      <td colSpan={colCount} className="netlens-empty">
+                        No packets match this filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredPackets.map((p) => {
+                      const rowClass = [
+                        rowClassForPacket(p),
+                        selectedId === p.id ? 'netlens-row--selected' : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' ')
+                      const infoText =
+                        p.payloadInfo && String(p.payloadInfo).trim()
+                          ? String(p.payloadInfo)
+                          : '—'
+                      return (
+                        <tr
+                          key={p.id}
+                          className={rowClass || undefined}
+                          tabIndex={0}
+                          role="button"
+                          aria-pressed={selectedId === p.id}
+                          aria-label={`Packet ${p.source} to ${p.destination}`}
+                          onClick={() => handleRowActivate(p)}
+                          onKeyDown={(e) => handleRowKeyDown(e, p)}
+                        >
+                          <td className="netlens-mono">{String(p.source)}</td>
+                          <td className="netlens-mono">
+                            {String(p.destination)}
+                          </td>
+                          <td>{String(p.protocol)}</td>
+                          <td className="netlens-num">{String(p.length)}</td>
+                          <td className="netlens-mono netlens-ts">
+                            {String(p.timestamp)}
+                          </td>
+                          <td
+                            className="netlens-info"
+                            title={infoText === '—' ? '' : infoText}
+                          >
+                            {infoText}
+                          </td>
+                        </tr>
+                      )
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
+
+          {selectedPacket && (
+            <aside
+              className="netlens-details"
+              aria-label="Packet details"
+            >
+              <div className="netlens-details-head">
+                <h2 className="netlens-details-title">Packet details</h2>
+                <button
+                  type="button"
+                  className="netlens-btn netlens-btn--ghost"
+                  onClick={() => setSelectedId(null)}
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="netlens-details-body">
+                <section className="netlens-details-section">
+                  <h3 className="netlens-details-h3">Decoded fields</h3>
+                  <dl className="netlens-details-dl">
+                    <dt>Source</dt>
+                    <dd className="netlens-mono">{String(selectedPacket.source)}</dd>
+                    <dt>Destination</dt>
+                    <dd className="netlens-mono">
+                      {String(selectedPacket.destination)}
+                    </dd>
+                    <dt>Protocol</dt>
+                    <dd>{String(selectedPacket.protocol)}</dd>
+                    <dt>Length</dt>
+                    <dd className="netlens-num">{String(selectedPacket.length)}</dd>
+                    <dt>Timestamp</dt>
+                    <dd className="netlens-mono netlens-ts">
+                      {String(selectedPacket.timestamp)}
+                    </dd>
+                    <dt>Application layer</dt>
+                    <dd>
+                      {selectedPacket.applicationLayer
+                        ? String(selectedPacket.applicationLayer)
+                        : '—'}
+                    </dd>
+                    <dt>Payload / DPI</dt>
+                    <dd className="netlens-details-payload">
+                      {selectedPacket.payloadInfo
+                        ? String(selectedPacket.payloadInfo)
+                        : '—'}
+                    </dd>
+                  </dl>
+                </section>
+
+                <section className="netlens-details-section">
+                  <h3 className="netlens-details-h3">Raw JSON</h3>
+                  <pre className="netlens-details-json">{detailJson}</pre>
+                </section>
+              </div>
+            </aside>
+          )}
         </div>
       </main>
     </div>
