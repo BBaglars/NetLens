@@ -37,6 +37,48 @@
   gap: 0.875rem;
 }
 
+.netlens-header-right {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.875rem 1rem;
+}
+
+/* Dark-theme control: freeze / resume */
+.netlens-btn {
+  font: inherit;
+  cursor: pointer;
+  border-radius: 10px;
+  padding: 0.5rem 1.1rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  background: linear-gradient(180deg, rgba(36, 44, 58, 0.95) 0%, rgba(22, 27, 34, 0.98) 100%);
+  color: #e6edf3;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s,
+    background 0.2s;
+}
+
+.netlens-btn:hover {
+  border-color: rgba(88, 166, 255, 0.55);
+  box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.12), 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.netlens-btn:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.netlens-btn--freeze.netlens-btn--active {
+  border-color: rgba(234, 179, 8, 0.55);
+  background: linear-gradient(180deg, rgba(58, 48, 24, 0.95) 0%, rgba(34, 28, 16, 0.98) 100%);
+  color: #fcd34d;
+}
+
 /* Decorative "lens" accent */
 .netlens-logo {
   width: 2.5rem;
@@ -77,6 +119,13 @@
   background: #22c55e;
   box-shadow: 0 0 10px rgba(34, 197, 94, 0.85);
   animation: netlens-pulse 1.2s ease-in-out infinite;
+}
+
+.netlens-live-dot--paused {
+  background: #6b7280;
+  box-shadow: none;
+  animation: none;
+  opacity: 0.85;
 }
 
 @keyframes netlens-pulse {
@@ -125,6 +174,114 @@
   font-size: 0.75rem;
   color: #6e7681;
   font-family: ui-monospace, Consolas, monospace;
+}
+
+/* Glassmorphism stat cards */
+.netlens-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1rem;
+  padding: 1rem 1.25rem;
+  border-bottom: 1px solid rgba(48, 54, 61, 0.65);
+  background: rgba(8, 11, 15, 0.25);
+}
+
+@media (max-width: 900px) {
+  .netlens-stats {
+    grid-template-columns: 1fr;
+  }
+}
+
+.netlens-stat-card {
+  border-radius: 12px;
+  padding: 1rem 1.15rem;
+  background: rgba(22, 27, 34, 0.45);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow:
+    0 4px 24px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+}
+
+.netlens-stat-label {
+  display: block;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #8b949e;
+  margin-bottom: 0.45rem;
+}
+
+.netlens-stat-value {
+  display: block;
+  font-size: 1.35rem;
+  font-weight: 600;
+  color: #f0f6fc;
+  line-height: 1.2;
+}
+
+.netlens-stat-value--mono {
+  font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+}
+
+.netlens-stat-value--truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+/* Search toolbar above the table */
+.netlens-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem 1rem;
+  padding: 0.85rem 1.25rem;
+  border-bottom: 1px solid rgba(48, 54, 61, 0.9);
+  background: rgba(13, 17, 23, 0.45);
+}
+
+.netlens-search-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #6e7681;
+}
+
+.netlens-search {
+  flex: 1;
+  min-width: 200px;
+  font: inherit;
+  font-size: 0.875rem;
+  padding: 0.55rem 0.85rem;
+  border-radius: 10px;
+  border: 1px solid rgba(48, 54, 61, 0.95);
+  background: rgba(13, 17, 23, 0.85);
+  color: #e6edf3;
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.25);
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s;
+}
+
+.netlens-search::placeholder {
+  color: #6e7681;
+}
+
+.netlens-search:hover {
+  border-color: rgba(88, 166, 255, 0.25);
+}
+
+.netlens-search:focus {
+  outline: none;
+  border-color: rgba(88, 166, 255, 0.5);
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.25),
+    0 0 0 3px rgba(88, 166, 255, 0.15);
 }
 
 .netlens-table-wrap {
