@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -21,10 +22,12 @@ import (
 )
 
 // PacketData is the wire format for browser/clients; JSON tags keep field names stable over the WebSocket API.
+// Source and Destination are strings long enough for any textual IP (IPv4 dotted quad; IPv6 as eight 4-digit hex groups).
+// L4 endpoints use host:port for IPv4 and [host]:port for IPv6.
 type PacketData struct {
 	Source           string    `json:"source"`
 	Destination      string    `json:"destination"`
-	Protocol         string    `json:"protocol"` // Transport / network helper: TCP, UDP, ICMPv4
+	Protocol         string    `json:"protocol"` // TCP, UDP, ICMPv4, ICMPv6
 	Payload          string    `json:"payload,omitempty"`
 	Length           int       `json:"length"`
 	Timestamp        time.Time `json:"timestamp"`
@@ -76,17 +79,25 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// formatIP returns a canonical string for an IPv4 or IPv6 address (IPv6 uses net.IP.String() / RFC 5952).
+func formatIP(ip net.IP) string {
+	if ip == nil {
+		return ""
+	}
+	return ip.String()
+}
+
 // tcpFlowString builds "IP:port" endpoints when both network and TCP layers are present.
 // IPv6 addresses are bracketed so the colon in the address does not collide with port syntax.
 func tcpFlowString(network gopacket.NetworkLayer, tcp *layers.TCP) (src, dst string, ok bool) {
 	switch n := network.(type) {
 	case *layers.IPv4:
-		return fmt.Sprintf("%s:%d", n.SrcIP, tcp.SrcPort),
-			fmt.Sprintf("%s:%d", n.DstIP, tcp.DstPort),
+		return fmt.Sprintf("%s:%d", formatIP(n.SrcIP), tcp.SrcPort),
+			fmt.Sprintf("%s:%d", formatIP(n.DstIP), tcp.DstPort),
 			true
 	case *layers.IPv6:
-		return fmt.Sprintf("[%s]:%d", n.SrcIP, tcp.SrcPort),
-			fmt.Sprintf("[%s]:%d", n.DstIP, tcp.DstPort),
+		return fmt.Sprintf("[%s]:%d", formatIP(n.SrcIP), tcp.SrcPort),
+			fmt.Sprintf("[%s]:%d", formatIP(n.DstIP), tcp.DstPort),
 			true
 	default:
 		return "", "", false
@@ -97,12 +108,12 @@ func tcpFlowString(network gopacket.NetworkLayer, tcp *layers.TCP) (src, dst str
 func udpFlowString(network gopacket.NetworkLayer, udp *layers.UDP) (src, dst string, ok bool) {
 	switch n := network.(type) {
 	case *layers.IPv4:
-		return fmt.Sprintf("%s:%d", n.SrcIP, udp.SrcPort),
-			fmt.Sprintf("%s:%d", n.DstIP, udp.DstPort),
+		return fmt.Sprintf("%s:%d", formatIP(n.SrcIP), udp.SrcPort),
+			fmt.Sprintf("%s:%d", formatIP(n.DstIP), udp.DstPort),
 			true
 	case *layers.IPv6:
-		return fmt.Sprintf("[%s]:%d", n.SrcIP, udp.SrcPort),
-			fmt.Sprintf("[%s]:%d", n.DstIP, udp.DstPort),
+		return fmt.Sprintf("[%s]:%d", formatIP(n.SrcIP), udp.SrcPort),
+			fmt.Sprintf("[%s]:%d", formatIP(n.DstIP), udp.DstPort),
 			true
 	default:
 		return "", "", false
@@ -159,16 +170,36 @@ func isPrintablePayload(b []byte) bool {
 	return true
 }
 
-// ipEndpointPair returns host-only endpoints for ICMP (no ports).
+// ipEndpointPair returns host-only endpoints for ICMP (no ports), using canonical IP strings.
 func ipEndpointPair(network gopacket.NetworkLayer) (src, dst string, ok bool) {
 	switch n := network.(type) {
 	case *layers.IPv4:
-		return n.SrcIP.String(), n.DstIP.String(), true
+		return formatIP(n.SrcIP), formatIP(n.DstIP), true
 	case *layers.IPv6:
-		return n.SrcIP.String(), n.DstIP.String(), true
+		return formatIP(n.SrcIP), formatIP(n.DstIP), true
 	default:
 		return "", "", false
 	}
+}
+
+// packetIPv4OrIPv6Network returns the IPv4 or IPv6 layer when present (LayerTypeIPv4 / LayerTypeIPv6).
+func packetIPv4OrIPv6Network(packet gopacket.Packet) gopacket.NetworkLayer {
+	if l := packet.Layer(layers.LayerTypeIPv4); l != nil {
+		if v4, ok := l.(*layers.IPv4); ok {
+			return v4
+		}
+	}
+	if l := packet.Layer(layers.LayerTypeIPv6); l != nil {
+		if v6, ok := l.(*layers.IPv6); ok {
+			return v6
+		}
+	}
+	return nil
+}
+
+// icmpPayloadInfo builds a consistent Type/Code summary for ICMPv4 and ICMPv6 (including echo request/reply).
+func icmpPayloadInfo(typeVal, codeVal uint8) string {
+	return fmt.Sprintf("Type: %d Code: %d", typeVal, codeVal)
 }
 
 const (
@@ -385,12 +416,13 @@ func inspectDNSLayer(packet gopacket.Packet, udp *layers.UDP) string {
 }
 
 // runCapture decodes live frames in the background so the HTTP server can accept WebSocket clients immediately.
-// Each frame is classified using gopacket layer types (TCP / UDP / ICMPv4); at most one branch runs per packet.
+// Only IPv4 and IPv6 frames are processed; each frame matches at most one of TCP, UDP, ICMPv4, or ICMPv6.
 func runCapture(h *hub, handle *pcap.Handle) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 
 	for packet := range packetSource.Packets() {
-		netLayer := packet.NetworkLayer()
+		// Only IPv4 / IPv6 (skips ARP and other non-IP L3 frames).
+		netLayer := packetIPv4OrIPv6Network(packet)
 		if netLayer == nil {
 			continue
 		}
@@ -472,7 +504,33 @@ func runCapture(h *hub, handle *pcap.Handle) {
 				Payload:     payloadToReadableString(raw),
 				Length:      packetLength(packet),
 				Timestamp:   packetTimestamp(packet),
-				PayloadInfo: fmt.Sprintf("Type:%d Code:%d", icmp4.TypeCode.Type(), icmp4.TypeCode.Code()),
+				PayloadInfo: icmpPayloadInfo(icmp4.TypeCode.Type(), icmp4.TypeCode.Code()),
+			}
+			emitPacket(h, pd)
+			continue
+		}
+
+		if lay := packet.Layer(layers.LayerTypeICMPv6); lay != nil {
+			icmp6, ok := lay.(*layers.ICMPv6)
+			if !ok {
+				continue
+			}
+			src, dst, ok := ipEndpointPair(netLayer)
+			if !ok {
+				continue
+			}
+			raw := icmp6.LayerPayload()
+			// Echo Request (128) / Echo Reply (129) and all other ICMPv6 types use the same summary shape.
+			pInfo := icmpPayloadInfo(icmp6.TypeCode.Type(), icmp6.TypeCode.Code())
+
+			pd := PacketData{
+				Source:      src,
+				Destination: dst,
+				Protocol:    "ICMPv6",
+				Payload:     payloadToReadableString(raw),
+				Length:      packetLength(packet),
+				Timestamp:   packetTimestamp(packet),
+				PayloadInfo: pInfo,
 			}
 			emitPacket(h, pd)
 			continue

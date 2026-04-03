@@ -25,13 +25,20 @@ function isDnsPacket(p) {
 }
 
 /**
- * Coarse transport key from the wire protocol field (ICMPv4 → ICMP).
+ * Coarse transport key from the wire protocol field (ICMPv4 / ICMPv6 → ICMP for filters & styling).
  */
 function transportKey(protocol) {
   const u = String(protocol || '').toUpperCase()
   if (u === 'TCP') return 'TCP'
   if (u === 'UDP') return 'UDP'
-  if (u === 'ICMPV4' || u === 'ICMP' || u.startsWith('ICMP')) return 'ICMP'
+  if (
+    u === 'ICMPV4' ||
+    u === 'ICMPV6' ||
+    u === 'ICMP' ||
+    u.startsWith('ICMP')
+  ) {
+    return 'ICMP'
+  }
   return 'OTHER'
 }
 
@@ -40,8 +47,10 @@ function transportKey(protocol) {
  */
 function displayProtocol(p) {
   if (isDnsPacket(p)) return 'DNS'
+  const raw = String(p.protocol || '').toUpperCase()
+  if (raw === 'ICMPV6') return 'ICMPv6'
+  if (raw === 'ICMPV4') return 'ICMPv4'
   const k = transportKey(p.protocol)
-  if (k === 'ICMP') return 'ICMP'
   if (k === 'OTHER') return String(p.protocol || '—')
   return k
 }
@@ -84,7 +93,7 @@ function getDestinationPort(endpoint) {
 }
 
 /**
- * Host part of an endpoint for top-destination stats.
+ * Host part of an endpoint for top-destination stats (IPv4 :port, [IPv6]:port, or bare IPv6 for ICMP).
  */
 function extractDestinationHost(destination) {
   if (typeof destination !== 'string' || !destination.trim()) return null
@@ -93,6 +102,15 @@ function extractDestinationHost(destination) {
     const end = s.indexOf(']')
     if (end > 1) return s.slice(1, end)
     return null
+  }
+  // IPv4 with port: d.d.d.d:port only (single colon before decimal port).
+  if (/^(\d{1,3}\.){3}\d{1,3}:\d+$/.test(s)) {
+    return s.slice(0, s.lastIndexOf(':'))
+  }
+  // Bare IPv6 has multiple colons; do not strip "::" segments as a bogus TCP port.
+  const colonCount = (s.match(/:/g) || []).length
+  if (colonCount >= 2) {
+    return s
   }
   const lastColon = s.lastIndexOf(':')
   if (lastColon <= 0) return s
@@ -130,11 +148,12 @@ function matchesProtocolSelection(p, sel) {
 }
 
 /**
- * Unified search: IP/endpoints, raw payload, DPI strings, protocol names, ports.
+ * Unified search: IP/endpoints (including IPv6 with ':'), payload, DPI, protocol; numeric-only → port match.
  */
 function matchesSearchQuery(p, rawQuery) {
-  const q = rawQuery.trim().toLowerCase()
+  const q = rawQuery.trim()
   if (!q) return true
+  const qLower = q.toLowerCase()
   const chunks = [
     p.source,
     p.destination,
@@ -145,8 +164,10 @@ function matchesSearchQuery(p, rawQuery) {
     displayProtocol(p),
   ]
   for (const chunk of chunks) {
-    if (String(chunk || '').toLowerCase().includes(q)) return true
+    const hay = String(chunk || '').toLowerCase()
+    if (hay.includes(qLower)) return true
   }
+  // Port shortcut only when the query is digits-only (so "fe80::1" is never parsed as port).
   if (/^\d+$/.test(q)) {
     const port = parseInt(q, 10)
     const ps = getDestinationPort(String(p.source))
@@ -306,7 +327,13 @@ function App() {
     <div className="netlens">
       <header className="netlens-header">
         <div className="netlens-brand">
-          <span className="netlens-logo" aria-hidden="true" />
+          <img
+            className="netlens-logo"
+            src="/favicon.png"
+            alt="NetLens"
+            width={44}
+            height={44}
+          />
           <div className="netlens-brand-text">
             <h1 className="netlens-title">{APP_TITLE}</h1>
             <p className="netlens-tagline">Live packet intelligence</p>
@@ -360,7 +387,7 @@ function App() {
               <div className="netlens-stat-card">
                 <span className="netlens-stat-label">Top destination</span>
                 <span
-                  className="netlens-stat-value netlens-stat-value--mono netlens-stat-value--truncate"
+                  className="netlens-stat-value netlens-stat-value--mono netlens-stat-value--top-dest"
                   title={topDestination}
                 >
                   {topDestination}
@@ -417,9 +444,10 @@ function App() {
                 </label>
                 <input
                   id="netlens-search"
-                  type="search"
+                  type="text"
+                  inputMode="search"
                   className="netlens-search"
-                  placeholder="IP, port, or payload text (SNI, GET, Query, hex…)…"
+                  placeholder="IPv4, IPv6 (::), port, or payload text…"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   autoComplete="off"
@@ -432,8 +460,8 @@ function App() {
               <table className="netlens-table">
                 <thead>
                   <tr>
-                    <th>Source</th>
-                    <th>Destination</th>
+                    <th className="netlens-th-endpoint">Source</th>
+                    <th className="netlens-th-endpoint">Destination</th>
                     <th>Protocol</th>
                     <th>Length</th>
                     <th>Time</th>
@@ -476,8 +504,16 @@ function App() {
                           onClick={() => handleRowActivate(p)}
                           onKeyDown={(e) => handleRowKeyDown(e, p)}
                         >
-                          <td className="netlens-mono">{String(p.source)}</td>
-                          <td className="netlens-mono">
+                          <td
+                            className="netlens-mono netlens-td-endpoint"
+                            title={String(p.source)}
+                          >
+                            {String(p.source)}
+                          </td>
+                          <td
+                            className="netlens-mono netlens-td-endpoint"
+                            title={String(p.destination)}
+                          >
                             {String(p.destination)}
                           </td>
                           <td className="netlens-td-protocol">
@@ -525,9 +561,11 @@ function App() {
                   <h3 className="netlens-details-h3">Layers & endpoints</h3>
                   <dl className="netlens-details-dl">
                     <dt>Source</dt>
-                    <dd className="netlens-mono">{String(selectedPacket.source)}</dd>
+                    <dd className="netlens-mono netlens-dd-endpoint">
+                      {String(selectedPacket.source)}
+                    </dd>
                     <dt>Destination</dt>
-                    <dd className="netlens-mono">
+                    <dd className="netlens-mono netlens-dd-endpoint">
                       {String(selectedPacket.destination)}
                     </dd>
                     <dt>Protocol</dt>
