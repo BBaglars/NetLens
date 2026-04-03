@@ -7,8 +7,72 @@ const APP_TITLE = 'NetLens'
 const PPS_WINDOW_MS = 1000
 const PPS_TICK_MS = 200
 
+/** Initial protocol toggles: all visible until user narrows the selection. */
+const DEFAULT_PROTO_SELECTION = {
+  tcp: true,
+  udp: true,
+  icmp: true,
+  dns: true,
+}
+
 /**
- * Extract TCP/UDP destination port from a "host:port" or "[ipv6]:port" string.
+ * True when backend marked the packet as DNS (UDP/53 DPI).
+ */
+function isDnsPacket(p) {
+  const app = String(p.applicationLayer || '').toUpperCase()
+  if (app === 'DNS') return true
+  return /^query:/i.test(String(p.payloadInfo || '').trim())
+}
+
+/**
+ * Coarse transport key from the wire protocol field (ICMPv4 → ICMP).
+ */
+function transportKey(protocol) {
+  const u = String(protocol || '').toUpperCase()
+  if (u === 'TCP') return 'TCP'
+  if (u === 'UDP') return 'UDP'
+  if (u === 'ICMPV4' || u === 'ICMP' || u.startsWith('ICMP')) return 'ICMP'
+  return 'OTHER'
+}
+
+/**
+ * Label for the Protocol column (DNS overrides bare UDP when applicable).
+ */
+function displayProtocol(p) {
+  if (isDnsPacket(p)) return 'DNS'
+  const k = transportKey(p.protocol)
+  if (k === 'ICMP') return 'ICMP'
+  if (k === 'OTHER') return String(p.protocol || '—')
+  return k
+}
+
+/**
+ * Badge variant for protocol / DNS display.
+ */
+function protocolBadgeClass(p) {
+  if (isDnsPacket(p)) return 'netlens-proto-badge netlens-proto-badge--dns'
+  const k = transportKey(p.protocol)
+  const base = 'netlens-proto-badge'
+  if (k === 'TCP') return `${base} ${base}--tcp`
+  if (k === 'UDP') return `${base} ${base}--udp`
+  if (k === 'ICMP') return `${base} ${base}--icmp`
+  return `${base} ${base}--other`
+}
+
+/**
+ * Left stripe class: DNS > ICMP > TCP > UDP (DNS is not styled as generic UDP).
+ */
+function rowStripeClass(p) {
+  if (isDnsPacket(p)) return 'netlens-row--stripe-dns'
+  const k = transportKey(p.protocol)
+  if (k === 'TCP') return 'netlens-row--stripe-tcp'
+  if (k === 'ICMP') return 'netlens-row--stripe-icmp'
+  if (k === 'UDP') return 'netlens-row--stripe-udp'
+  return 'netlens-row--stripe-other'
+}
+
+/**
+ * Extract TCP/UDP port from host:port or [ipv6]:port.
  */
 function getDestinationPort(endpoint) {
   if (typeof endpoint !== 'string') return null
@@ -20,7 +84,7 @@ function getDestinationPort(endpoint) {
 }
 
 /**
- * Extract host/IP portion from an endpoint string (IPv4 host:port or [IPv6]:port).
+ * Host part of an endpoint for top-destination stats.
  */
 function extractDestinationHost(destination) {
   if (typeof destination !== 'string' || !destination.trim()) return null
@@ -38,53 +102,50 @@ function extractDestinationHost(destination) {
 }
 
 /**
- * Row highlight from application-layer DPI (fallback to well-known ports).
- */
-function rowClassForPacket(p) {
-  const app = String(p.applicationLayer || '').toUpperCase()
-  if (app === 'TLS') return 'netlens-row--tls'
-  if (app === 'HTTP') return 'netlens-row--http'
-  if (app === 'DNS' || String(p.protocol || '').toUpperCase() === 'DNS') {
-    return 'netlens-row--dns'
-  }
-  const port = getDestinationPort(String(p.destination))
-  if (port === 443) return 'netlens-row--tls'
-  if (port === 80) return 'netlens-row--http'
-  return ''
-}
-
-/**
- * Build a plain object for the details panel / JSON export (no internal id).
+ * JSON-safe detail object for the side panel (no React id).
  */
 function packetToDetailObject(p) {
   return {
     source: p.source,
     destination: p.destination,
-    protocol: p.protocol,
+    protocol: displayProtocol(p),
     length: p.length,
     timestamp: p.timestamp,
-    applicationLayer: p.applicationLayer || '',
-    payloadInfo: p.payloadInfo || '',
+    applicationLayer: p.applicationLayer ? String(p.applicationLayer) : '',
+    payloadInfo: p.payloadInfo ? String(p.payloadInfo) : '',
+    payload: p.payload ? String(p.payload) : '',
   }
 }
 
 /**
- * Live filter: substring match on endpoints, payload info, app layer; numeric query matches ports.
+ * Show packet only if its category toggle is on (DNS is separate from generic UDP).
  */
-function rowMatchesSearch(p, rawQuery) {
+function matchesProtocolSelection(p, sel) {
+  if (isDnsPacket(p)) return sel.dns
+  const k = transportKey(p.protocol)
+  if (k === 'TCP') return sel.tcp
+  if (k === 'ICMP') return sel.icmp
+  if (k === 'UDP') return sel.udp
+  return false
+}
+
+/**
+ * Unified search: IP/endpoints, raw payload, DPI strings, protocol names, ports.
+ */
+function matchesSearchQuery(p, rawQuery) {
   const q = rawQuery.trim().toLowerCase()
   if (!q) return true
-  const src = String(p.source).toLowerCase()
-  const dst = String(p.destination).toLowerCase()
-  const info = String(p.payloadInfo || '').toLowerCase()
-  const app = String(p.applicationLayer || '').toLowerCase()
-  if (
-    src.includes(q) ||
-    dst.includes(q) ||
-    info.includes(q) ||
-    app.includes(q)
-  ) {
-    return true
+  const chunks = [
+    p.source,
+    p.destination,
+    p.payload,
+    p.payloadInfo,
+    p.applicationLayer,
+    p.protocol,
+    displayProtocol(p),
+  ]
+  for (const chunk of chunks) {
+    if (String(chunk || '').toLowerCase().includes(q)) return true
   }
   if (/^\d+$/.test(q)) {
     const port = parseInt(q, 10)
@@ -95,9 +156,29 @@ function rowMatchesSearch(p, rawQuery) {
   return false
 }
 
+/**
+ * Monospace payload block; hex: prefix uses terminal styling via CSS modifier.
+ */
+function PayloadCodeBlock({ value }) {
+  const raw = value == null ? '' : String(value)
+  const trimmed = raw.trim()
+  if (!trimmed) {
+    return <span className="netlens-code netlens-code--empty">—</span>
+  }
+  const isHex = trimmed.startsWith('hex:')
+  return (
+    <pre
+      className={`netlens-code ${isHex ? 'netlens-code--terminal' : 'netlens-code--plain'}`}
+    >
+      {raw}
+    </pre>
+  )
+}
+
 function App() {
   const [packets, setPackets] = useState([])
   const [frozen, setFrozen] = useState(false)
+  const [protoSel, setProtoSel] = useState(() => ({ ...DEFAULT_PROTO_SELECTION }))
   const [searchQuery, setSearchQuery] = useState('')
   const [totalPackets, setTotalPackets] = useState(0)
   const [pps, setPps] = useState(0)
@@ -140,6 +221,7 @@ function App() {
           protocol: data.protocol ?? '—',
           length: data.length ?? '—',
           timestamp: data.timestamp ?? '—',
+          payload: data.payload ?? '',
           payloadInfo: data.payloadInfo ?? '',
           applicationLayer: data.applicationLayer ?? '',
         }
@@ -178,14 +260,27 @@ function App() {
   }, [])
 
   const filteredPackets = useMemo(
-    () => packets.filter((p) => rowMatchesSearch(p, searchQuery)),
-    [packets, searchQuery],
+    () =>
+      packets.filter(
+        (p) =>
+          matchesProtocolSelection(p, protoSel) &&
+          matchesSearchQuery(p, searchQuery),
+      ),
+    [packets, protoSel, searchQuery],
   )
 
   const selectedPacket = useMemo(
     () => packets.find((p) => p.id === selectedId) ?? null,
     [packets, selectedId],
   )
+
+  const toggleProto = (key) => {
+    setProtoSel((prev) => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const selectAllProtos = () => {
+    setProtoSel({ ...DEFAULT_PROTO_SELECTION })
+  }
 
   const toggleFreeze = () => setFrozen((f) => !f)
 
@@ -205,13 +300,17 @@ function App() {
     : ''
 
   const colCount = 6
+  const allProtoOn = Object.values(protoSel).every(Boolean)
 
   return (
     <div className="netlens">
       <header className="netlens-header">
         <div className="netlens-brand">
           <span className="netlens-logo" aria-hidden="true" />
-          <h1 className="netlens-title">{APP_TITLE}</h1>
+          <div className="netlens-brand-text">
+            <h1 className="netlens-title">{APP_TITLE}</h1>
+            <p className="netlens-tagline">Live packet intelligence</p>
+          </div>
         </div>
         <div className="netlens-header-right">
           <button
@@ -247,7 +346,7 @@ function App() {
 
             <div className="netlens-stats">
               <div className="netlens-stat-card">
-                <span className="netlens-stat-label">Total Packets</span>
+                <span className="netlens-stat-label">Total packets</span>
                 <span className="netlens-stat-value netlens-stat-value--mono">
                   {totalPackets.toLocaleString()}
                 </span>
@@ -259,7 +358,7 @@ function App() {
                 </span>
               </div>
               <div className="netlens-stat-card">
-                <span className="netlens-stat-label">Top Destination</span>
+                <span className="netlens-stat-label">Top destination</span>
                 <span
                   className="netlens-stat-value netlens-stat-value--mono netlens-stat-value--truncate"
                   title={topDestination}
@@ -269,20 +368,64 @@ function App() {
               </div>
             </div>
 
-            <div className="netlens-toolbar">
-              <label className="netlens-search-label" htmlFor="netlens-filter">
-                Filter
-              </label>
-              <input
-                id="netlens-filter"
-                type="search"
-                className="netlens-search"
-                placeholder="IP, port, protocol, or payload text…"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                autoComplete="off"
-                spellCheck={false}
-              />
+            <div className="netlens-filter-bar" role="search">
+              <div className="netlens-filter-bar__head">
+                <span className="netlens-filter-bar__title">Advanced filters</span>
+                <button
+                  type="button"
+                  className="netlens-link-btn"
+                  onClick={selectAllProtos}
+                  disabled={allProtoOn}
+                >
+                  Enable all protocols
+                </button>
+              </div>
+
+              <div className="netlens-filter-bar__proto-row">
+                <span className="netlens-filter-bar__label netlens-filter-bar__label--inline">
+                  Protocols
+                </span>
+                <div
+                  className="netlens-proto-chips"
+                  role="group"
+                  aria-label="Filter by protocol"
+                >
+                  {(
+                    [
+                      { key: 'tcp', label: 'TCP' },
+                      { key: 'udp', label: 'UDP' },
+                      { key: 'icmp', label: 'ICMP' },
+                      { key: 'dns', label: 'DNS' },
+                    ]
+                  ).map(({ key, label }) => (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`netlens-filter-chip netlens-filter-chip--${key}${protoSel[key] ? ' netlens-filter-chip--active' : ''}`}
+                      aria-pressed={protoSel[key]}
+                      onClick={() => toggleProto(key)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="netlens-search-row">
+                <label className="netlens-filter-bar__label" htmlFor="netlens-search">
+                  Search
+                </label>
+                <input
+                  id="netlens-search"
+                  type="search"
+                  className="netlens-search"
+                  placeholder="IP, port, or payload text (SNI, GET, Query, hex…)…"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
             </div>
 
             <div className="netlens-table-wrap">
@@ -307,13 +450,13 @@ function App() {
                   ) : filteredPackets.length === 0 ? (
                     <tr>
                       <td colSpan={colCount} className="netlens-empty">
-                        No packets match this filter.
+                        No packets match filters or search.
                       </td>
                     </tr>
                   ) : (
                     filteredPackets.map((p) => {
                       const rowClass = [
-                        rowClassForPacket(p),
+                        rowStripeClass(p),
                         selectedId === p.id ? 'netlens-row--selected' : '',
                       ]
                         .filter(Boolean)
@@ -337,7 +480,11 @@ function App() {
                           <td className="netlens-mono">
                             {String(p.destination)}
                           </td>
-                          <td>{String(p.protocol)}</td>
+                          <td className="netlens-td-protocol">
+                            <span className={protocolBadgeClass(p)}>
+                              {displayProtocol(p)}
+                            </span>
+                          </td>
                           <td className="netlens-num">{String(p.length)}</td>
                           <td className="netlens-mono netlens-ts">
                             {String(p.timestamp)}
@@ -358,12 +505,12 @@ function App() {
           </div>
 
           {selectedPacket && (
-            <aside
-              className="netlens-details"
-              aria-label="Packet details"
-            >
+            <aside className="netlens-details" aria-label="Packet detail">
               <div className="netlens-details-head">
-                <h2 className="netlens-details-title">Packet details</h2>
+                <div>
+                  <h2 className="netlens-details-title">Packet detail</h2>
+                  <p className="netlens-details-sub">Layer summary & raw capture</p>
+                </div>
                 <button
                   type="button"
                   className="netlens-btn netlens-btn--ghost"
@@ -375,7 +522,7 @@ function App() {
 
               <div className="netlens-details-body">
                 <section className="netlens-details-section">
-                  <h3 className="netlens-details-h3">Decoded fields</h3>
+                  <h3 className="netlens-details-h3">Layers & endpoints</h3>
                   <dl className="netlens-details-dl">
                     <dt>Source</dt>
                     <dd className="netlens-mono">{String(selectedPacket.source)}</dd>
@@ -384,12 +531,10 @@ function App() {
                       {String(selectedPacket.destination)}
                     </dd>
                     <dt>Protocol</dt>
-                    <dd>{String(selectedPacket.protocol)}</dd>
-                    <dt>Length</dt>
-                    <dd className="netlens-num">{String(selectedPacket.length)}</dd>
-                    <dt>Timestamp</dt>
-                    <dd className="netlens-mono netlens-ts">
-                      {String(selectedPacket.timestamp)}
+                    <dd>
+                      <span className={protocolBadgeClass(selectedPacket)}>
+                        {displayProtocol(selectedPacket)}
+                      </span>
                     </dd>
                     <dt>Application layer</dt>
                     <dd>
@@ -397,17 +542,28 @@ function App() {
                         ? String(selectedPacket.applicationLayer)
                         : '—'}
                     </dd>
-                    <dt>Payload / DPI</dt>
-                    <dd className="netlens-details-payload">
+                    <dt>DPI / metadata</dt>
+                    <dd className="netlens-details-meta">
                       {selectedPacket.payloadInfo
                         ? String(selectedPacket.payloadInfo)
                         : '—'}
                     </dd>
+                    <dt>Timestamp</dt>
+                    <dd className="netlens-mono netlens-ts">
+                      {String(selectedPacket.timestamp)}
+                    </dd>
+                    <dt>Length</dt>
+                    <dd className="netlens-num">{String(selectedPacket.length)}</dd>
                   </dl>
                 </section>
 
+                <section className="netlens-details-section netlens-details-section--payload">
+                  <h3 className="netlens-details-h3">Payload (raw)</h3>
+                  <PayloadCodeBlock value={selectedPacket.payload} />
+                </section>
+
                 <section className="netlens-details-section">
-                  <h3 className="netlens-details-h3">Raw JSON</h3>
+                  <h3 className="netlens-details-h3">JSON</h3>
                   <pre className="netlens-details-json">{detailJson}</pre>
                 </section>
               </div>

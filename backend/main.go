@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -21,13 +22,14 @@ import (
 
 // PacketData is the wire format for browser/clients; JSON tags keep field names stable over the WebSocket API.
 type PacketData struct {
-	Source            string    `json:"source"`
-	Destination       string    `json:"destination"`
-	Protocol          string    `json:"protocol"`
-	Length            int       `json:"length"`
-	Timestamp         time.Time `json:"timestamp"`
-	PayloadInfo       string    `json:"payloadInfo,omitempty"`
-	ApplicationLayer  string    `json:"applicationLayer,omitempty"`
+	Source           string    `json:"source"`
+	Destination      string    `json:"destination"`
+	Protocol         string    `json:"protocol"` // Transport / network helper: TCP, UDP, ICMPv4
+	Payload          string    `json:"payload,omitempty"`
+	Length           int       `json:"length"`
+	Timestamp        time.Time `json:"timestamp"`
+	PayloadInfo      string    `json:"payloadInfo,omitempty"`
+	ApplicationLayer string    `json:"applicationLayer,omitempty"`
 }
 
 // hub tracks active WebSocket connections and broadcasts JSON payloads with one writer at a time per connection.
@@ -121,6 +123,52 @@ func packetLength(packet gopacket.Packet) int {
 		return md.CaptureLength
 	}
 	return len(packet.Data())
+}
+
+// maxPayloadField limits JSON/WebSocket size; very large captures are truncated in the text field.
+const maxPayloadField = 4096
+
+// payloadToReadableString turns raw layer bytes into a JSON-safe string: printable ASCII as UTF-8 text, otherwise a hex prefix.
+func payloadToReadableString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	total := len(b)
+	out := b
+	suffix := ""
+	if len(out) > maxPayloadField {
+		out = b[:maxPayloadField]
+		suffix = fmt.Sprintf(" … [truncated, %d bytes total]", total)
+	}
+	if isPrintablePayload(out) {
+		return string(out) + suffix
+	}
+	return "hex:" + hex.EncodeToString(out) + suffix
+}
+
+// isPrintablePayload allows common whitespace; extended/binary data forces hex encoding for stable JSON.
+func isPrintablePayload(b []byte) bool {
+	for _, c := range b {
+		if c < 0x20 && c != '\t' && c != '\n' && c != '\r' {
+			return false
+		}
+		if c > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// ipEndpointPair returns host-only endpoints for ICMP (no ports).
+func ipEndpointPair(network gopacket.NetworkLayer) (src, dst string, ok bool) {
+	switch n := network.(type) {
+	case *layers.IPv4:
+		return n.SrcIP.String(), n.DstIP.String(), true
+	case *layers.IPv6:
+		return n.SrcIP.String(), n.DstIP.String(), true
+	default:
+		return "", "", false
+	}
 }
 
 const (
@@ -337,76 +385,108 @@ func inspectDNSLayer(packet gopacket.Packet, udp *layers.UDP) string {
 }
 
 // runCapture decodes live frames in the background so the HTTP server can accept WebSocket clients immediately.
+// Each frame is classified using gopacket layer types (TCP / UDP / ICMPv4); at most one branch runs per packet.
 func runCapture(h *hub, handle *pcap.Handle) {
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 
 	for packet := range packetSource.Packets() {
 		netLayer := packet.NetworkLayer()
-		transLayer := packet.TransportLayer()
-		if netLayer == nil || transLayer == nil {
+		if netLayer == nil {
 			continue
 		}
 
-		switch tl := transLayer.(type) {
-		case *layers.TCP:
-			src, dst, ok := tcpFlowString(netLayer, tl)
+		// LayerType* constants are registered with gopacket and match packet.Layer(...) lookups.
+		if lay := packet.Layer(layers.LayerTypeTCP); lay != nil {
+			tcp, ok := lay.(*layers.TCP)
 			if !ok {
 				continue
 			}
-			payload := tl.Payload
-			appLayer, pInfo := inspectTCPApplicationLayer(tl, payload)
+			src, dst, ok := tcpFlowString(netLayer, tcp)
+			if !ok {
+				continue
+			}
+			raw := tcp.Payload
+			appLayer, pInfo := inspectTCPApplicationLayer(tcp, raw)
 
 			pd := PacketData{
 				Source:           src,
 				Destination:      dst,
 				Protocol:         "TCP",
+				Payload:          payloadToReadableString(raw),
 				Length:           packetLength(packet),
 				Timestamp:        packetTimestamp(packet),
 				PayloadInfo:      pInfo,
 				ApplicationLayer: appLayer,
 			}
+			emitPacket(h, pd)
+			continue
+		}
 
-			body, err := json.Marshal(pd)
-			if err != nil {
-				continue
-			}
-			h.broadcast(body)
-
-		case *layers.UDP:
-			// DNS DPI: only forward UDP/53 to avoid flooding clients with unrelated UDP traffic.
-			if tl.SrcPort != 53 && tl.DstPort != 53 {
-				continue
-			}
-			src, dst, ok := udpFlowString(netLayer, tl)
+		if lay := packet.Layer(layers.LayerTypeUDP); lay != nil {
+			udp, ok := lay.(*layers.UDP)
 			if !ok {
 				continue
 			}
-			query := inspectDNSLayer(packet, tl)
-			pInfo := ""
-			if query != "" {
-				pInfo = "Query: " + query
+			src, dst, ok := udpFlowString(netLayer, udp)
+			if !ok {
+				continue
+			}
+			raw := udp.Payload
+			appLayer, pInfo := "", ""
+			if udp.SrcPort == 53 || udp.DstPort == 53 {
+				if q := inspectDNSLayer(packet, udp); q != "" {
+					appLayer = "DNS"
+					pInfo = "Query: " + q
+				}
 			}
 
 			pd := PacketData{
 				Source:           src,
 				Destination:      dst,
-				Protocol:         "DNS",
+				Protocol:         "UDP",
+				Payload:          payloadToReadableString(raw),
 				Length:           packetLength(packet),
 				Timestamp:        packetTimestamp(packet),
 				PayloadInfo:      pInfo,
-				ApplicationLayer: "DNS",
+				ApplicationLayer: appLayer,
 			}
+			emitPacket(h, pd)
+			continue
+		}
 
-			body, err := json.Marshal(pd)
-			if err != nil {
+		if lay := packet.Layer(layers.LayerTypeICMPv4); lay != nil {
+			icmp4, ok := lay.(*layers.ICMPv4)
+			if !ok {
 				continue
 			}
-			h.broadcast(body)
+			src, dst, ok := ipEndpointPair(netLayer)
+			if !ok {
+				continue
+			}
+			raw := icmp4.LayerPayload()
 
-		default:
+			pd := PacketData{
+				Source:      src,
+				Destination: dst,
+				Protocol:    "ICMPv4",
+				Payload:     payloadToReadableString(raw),
+				Length:      packetLength(packet),
+				Timestamp:   packetTimestamp(packet),
+				PayloadInfo: fmt.Sprintf("Type:%d Code:%d", icmp4.TypeCode.Type(), icmp4.TypeCode.Code()),
+			}
+			emitPacket(h, pd)
 			continue
 		}
 	}
+}
+
+// emitPacket marshals and broadcasts a single PacketData record.
+func emitPacket(h *hub, pd PacketData) {
+	body, err := json.Marshal(pd)
+	if err != nil {
+		return
+	}
+	h.broadcast(body)
 }
 
 func main() {
