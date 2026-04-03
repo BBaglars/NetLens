@@ -1,0 +1,33 @@
+# Environment variables
+.env
+.env.*
+
+
+# Go binaries and build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+backend/backend.exe
+
+# Node.js and Frontend dependencies
+node_modules/
+dist/
+build/
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE and Editor directories
+.vscode/
+.idea/
