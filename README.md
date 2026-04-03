@@ -73,8 +73,13 @@ From **PowerShell** or **Command Prompt** (adjust paths if your clone location d
 
 ```powershell
 # Clone
+<<<<<<< HEAD
 git clone https://github.com/BBaglars/NetLens.git
 cd Netlens
+=======
+git clone https://github.com/your-org/netlens.git
+cd netlens
+>>>>>>> 4b0b9ad9f8c4d791c8875490afd1cd98d7bd35f7
 
 # Go backend — fetch modules and build
 cd backend
